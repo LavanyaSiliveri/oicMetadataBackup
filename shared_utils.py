@@ -62,6 +62,16 @@ def get_integration_client():
     return _resource_principal_or_file(oci.integration.IntegrationInstanceClient)
 
 
+# ─── OIC Instance Status ──────────────────────────────────────────────────────
+
+
+def get_instance_status(instance_ocid):
+    """Return the OIC instance lifecycle_state (e.g. ACTIVE, INACTIVE)."""
+    client   = get_integration_client()
+    instance = client.get_integration_instance(instance_ocid)
+    return instance.data.lifecycle_state
+
+
 # ─── Vault ────────────────────────────────────────────────────────────────────
 
 

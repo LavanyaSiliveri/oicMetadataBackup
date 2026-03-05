@@ -1,22 +1,24 @@
 """
-vbcsBackup.py — Visual Builder Cloud Service (VBCS) Application Backup.
+vbcsBackup.py — Visual Builder (VBCS) Application Backup.
 
-Lists all VBCS applications via the Builder Resources API, exports each
-application as a zip archive, and optionally exports every Business Object's
-data as a CSV file.  All artifacts are uploaded to OCI Object Storage.
+Lists all VBCS applications via the VB REST API, then exports each
+application archive and uploads it to OCI Object Storage.
+
+This supplements the OIC service-instance export (which backs up the
+app structure but NOT business object data).  This module exports each
+VBCS app as a standalone archive (.zip) that includes BO schemas and
+optionally BO data (CSV + JSON per entity).
 
 APIs used
 ---------
-List applications    : GET /ic/builder/resources/application/applist
-Export app archive   : GET /ic/builder/design/{appId}/{version}/resources/application
-List business objects: GET /ic/builder/design/{appId}/{version}/resources/application/businessObjects
-Export BO data (CSV) : GET /ic/builder/design/{appId}/{version}/resources/data/{boName}/collection
-                           with Accept: text/csv header
+List apps   : GET  /ic/builder/resources/application/applist
+Export app  : GET  /ic/builder/design/{appId}/{version}/resources/application/archive
+BO data     : GET  /{scope}/{appId}/{version}/resources/datamgr/export
 
 Required Vault secret keys
 --------------------------
-VBCS_HOST             : VBCS hostname (often the same as OIC_API_HOST for OIC Gen 3)
-                        e.g.  design.integration.<region>.ocp.oraclecloud.com
+VBCS_HOST             : VBCS hostname (often same as OIC_API_HOST for OIC Gen 3)
+                        e.g. design.integration.<region>.ocp.oraclecloud.com
 OBJ_STORAGE_NAMESPACE : OCI Object Storage tenancy namespace
 OBJ_STORAGE_BUCKET    : Bucket name for backup archives
 
@@ -30,7 +32,8 @@ VBCS_SCOPE            : OAuth2 scope for VBCS (defaults to OIC_SCOPE)
 Backup control flags in Vault secret
 -------------------------------------
 BACKUP_VBCS_DATA : "true" / "false"  (default: false)
-                   When true, each Business Object's rows are exported as CSV.
+                   Exports all business-object data per app as a single ZIP
+                   via the datamgr/export endpoint.
 """
 
 import logging
@@ -41,6 +44,7 @@ from shared_utils import (
     backup_timestamp,
     get_access_token,
     get_config_from_vault,
+    get_instance_status,
     send_failure_notification,
     upload_to_object_storage,
 )
@@ -48,8 +52,7 @@ from shared_utils import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VBCS_APPLIST_PATH = "/ic/builder/resources/application/applist"
-VBCS_DESIGN_BASE  = "/ic/builder/design"
+MAX_APPS = 100   # safety cap passed as count= to the applist query
 
 
 # ─── List Applications ────────────────────────────────────────────────────────
@@ -57,15 +60,18 @@ VBCS_DESIGN_BASE  = "/ic/builder/design"
 
 def list_vbcs_applications(config, access_token):
     """
-    Return all VBCS application entries from the applist API.
+    Retrieve all VBCS applications from the applist endpoint.
 
-    Each entry contains at minimum:
-      id              — application identifier used in design-time URLs
-      applicationName — human-readable name
-      version         — version string (e.g. "1.0")
-      url             — relative design-time URL
+    Query params request all states (development, stage, live) and only
+    the latest version of each app.
     """
-    url = f"https://{config['VBCS_HOST']}{VBCS_APPLIST_PATH}"
+    url = (
+        f"https://{config['VBCS_HOST']}"
+        f"/ic/builder/resources/application/applist"
+        f"?vbcsProjectType=t&latestVersions=t"
+        f"&development=t&stage=t&live=t"
+        f"&offset=0&count={MAX_APPS}"
+    )
     try:
         resp = requests.get(
             url,
@@ -73,7 +79,7 @@ def list_vbcs_applications(config, access_token):
             timeout=30,
         )
         resp.raise_for_status()
-        apps = resp.json().get("items", [])
+        apps = resp.json().get("items", resp.json().get("applications", []))
         logger.info(f"Found {len(apps)} VBCS application(s).")
         return apps
     except Exception as e:
@@ -84,101 +90,69 @@ def list_vbcs_applications(config, access_token):
 # ─── Export Application Archive ───────────────────────────────────────────────
 
 
-def export_vbcs_application(config, access_token, app_id, version):
+def export_vbcs_app_archive(config, access_token, app_id, version):
     """
-    Download the full VBCS application as a zip archive.
+    Export a single VBCS application as a binary zip archive.
 
-    The export endpoint returns the design-time source of the entire
-    application (pages, flows, business objects, service connections, etc.).
-
-    Returns bytes on success, None on failure.
+    Returns raw bytes on success, None on failure.
     """
     url = (
         f"https://{config['VBCS_HOST']}"
-        f"{VBCS_DESIGN_BASE}/{app_id}/{version}/resources/application"
+        f"/ic/builder/design/{app_id}/{version}"
+        f"/resources/application/archive"
     )
     try:
         resp = requests.get(
             url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/zip",
-            },
+            headers={"Authorization": f"Bearer {access_token}"},
             stream=True,
             timeout=120,
         )
         resp.raise_for_status()
         content = resp.content
-        logger.info(f"Exported VBCS app: {app_id}/{version} ({len(content):,} bytes)")
+        logger.info(f"Exported VBCS app archive: {app_id}/{version} ({len(content):,} bytes)")
         return content
     except Exception as e:
         logger.error(f"Failed to export VBCS app {app_id}/{version}: {e}")
         return None
 
 
-# ─── Business Objects ─────────────────────────────────────────────────────────
+# ─── Business Object Data ─────────────────────────────────────────────────────
 
 
-def list_business_objects(config, access_token, app_id, version):
+def export_vbcs_bo_data(config, access_token, app_id, version, scope="design"):
     """
-    Return the list of Business Object names defined in a VBCS application.
+    Export all business-object data for a VBCS application as a single ZIP
+    containing one CSV file per entity, using the datamgr/export endpoint.
 
-    Each entry typically contains:
-      name       — BO identifier used in data URLs
-      label      — human-readable label
-      fields     — array of field definitions
+    scope must be:
+      'design'     — for development/draft apps
+      'deployment' — for staged or live apps
     """
     url = (
         f"https://{config['VBCS_HOST']}"
-        f"{VBCS_DESIGN_BASE}/{app_id}/{version}"
-        f"/resources/application/businessObjects"
+        f"/ic/builder/{scope}/{app_id}/{version}"
+        f"/resources/datamgr/export"
     )
     try:
         resp = requests.get(
             url,
             headers={"Authorization": f"Bearer {access_token}"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        bos = resp.json().get("items", resp.json() if isinstance(resp.json(), list) else [])
-        logger.info(f"  {app_id}: found {len(bos)} business object(s).")
-        return bos
-    except Exception as e:
-        logger.error(f"Failed to list business objects for {app_id}/{version}: {e}")
-        return []
-
-
-def export_business_object_data(config, access_token, app_id, version, bo_name):
-    """
-    Export all rows of a Business Object as CSV.
-
-    Uses the VBCS data REST API with Accept: text/csv.
-    The ?limit parameter is set high to retrieve all records in a single call;
-    for very large BOs consider adding pagination.
-
-    Returns CSV bytes on success, None on failure.
-    """
-    url = (
-        f"https://{config['VBCS_HOST']}"
-        f"{VBCS_DESIGN_BASE}/{app_id}/{version}"
-        f"/resources/data/{bo_name}/collection"
-    )
-    try:
-        resp = requests.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "text/csv",
-            },
-            params={"limit": 100000},
+            stream=True,
             timeout=120,
         )
-        resp.raise_for_status()
-        content = resp.content
-        logger.info(f"  Exported BO data: {app_id}/{bo_name} ({len(content):,} bytes)")
-        return content
+        if resp.status_code == 200:
+            content = resp.content
+            logger.info(f"Exported BO data: {app_id}/{version} ({len(content):,} bytes)")
+            return content
+        else:
+            logger.warning(
+                f"BO data export for {app_id} returned {resp.status_code} "
+                "(app may have no business objects)"
+            )
+            return None
     except Exception as e:
-        logger.error(f"Failed to export BO data {app_id}/{bo_name}: {e}")
+        logger.error(f"Failed to export BO data for {app_id}/{version}: {e}")
         return None
 
 
@@ -189,23 +163,28 @@ def run_backup(secret_ocid):
     """
     End-to-end VBCS backup:
       1. Load config from OCI Vault
-      2. Obtain OAuth2 token (VBCS credentials fall back to OIC credentials)
-      3. List all VBCS applications
-      4. For each application:
-           a. Export application archive → {ts}/vbcs/{appId}_{version}.zip
+      2. Check OIC instance is ACTIVE (VBCS lives inside OIC)
+      3. Obtain OAuth2 token (VBCS credentials fall back to OIC credentials)
+      4. List all VBCS applications
+      5. For each application:
+           a. Export app archive (.zip)  → vbcs-backup/{ts}/{appId}_{version}_app.zip
            b. If BACKUP_VBCS_DATA=true:
-                - List all Business Objects
-                - Export each BO's data → {ts}/vbcs/{appId}/data/{boName}.csv
-      5. Notify on partial or total failure via ONS
+              Export BO data ZIP via datamgr/export (scope: design or deployment)
+              → vbcs-backup/{ts}/{appId}_{version}_bo_data.zip
+      6. Notify on partial or total failure via ONS
 
     Returns a summary dict.
     """
     config = get_config_from_vault(secret_ocid)
 
-    backup_data = config.get("BACKUP_VBCS_DATA", "false").lower() == "true"
-    namespace   = config["OBJ_STORAGE_NAMESPACE"]
-    bucket      = config["OBJ_STORAGE_BUCKET"]
-    ts          = backup_timestamp()
+    # Instance health check — VBCS lives inside OIC
+    if config.get("OIC_INSTANCE_OCID"):
+        status = get_instance_status(config["OIC_INSTANCE_OCID"])
+        if status == "INACTIVE":
+            msg = "OIC instance is INACTIVE. VBCS backup skipped."
+            logger.warning(msg)
+            send_failure_notification(config, msg, subject="VBCS Backup Skipped - Instance Inactive")
+            return {"status": "SKIPPED", "reason": msg}
 
     # OAuth2 — VBCS credentials fall back to OIC if not explicitly set
     try:
@@ -216,49 +195,44 @@ def run_backup(secret_ocid):
         send_failure_notification(config, msg, subject="VBCS Backup Failed - Auth Error")
         return {"status": "FAILED", "error": msg}
 
+    backup_data = config.get("BACKUP_VBCS_DATA", "false").lower() == "true"
+    namespace   = config["OBJ_STORAGE_NAMESPACE"]
+    bucket      = config["OBJ_STORAGE_BUCKET"]
+    ts          = backup_timestamp()
+
     apps = list_vbcs_applications(config, access_token)
     if not apps:
+        msg = "No VBCS applications found or failed to list applications."
+        logger.warning(msg)
         return {"status": "COMPLETED", "succeeded": 0, "failed": 0, "details": []}
 
     succeeded = []
     failed    = []
 
     for app in apps:
-        app_id   = app.get("id", app.get("applicationName", "unknown"))
-        app_name = app.get("applicationName", app_id)
-        version  = app.get("version", "1.0")
-        safe_ver = version.replace(".", "_")
+        app_id     = app.get("id", app.get("appId", "unknown"))
+        version    = app.get("version", "1.0")
+        app_status = app.get("state", app.get("status", "unknown"))
 
-        # ── Application archive (zip) ─────────────────────────────────────────
-        archive = export_vbcs_application(config, access_token, app_id, version)
+        # ── Application archive (.zip) ────────────────────────────────────────
+        archive = export_vbcs_app_archive(config, access_token, app_id, version)
         if archive:
-            obj_name = f"vbcs-backup/{ts}/{app_id}_{safe_ver}.zip"
-            upload_to_object_storage(namespace, bucket, obj_name, archive, content_type="application/zip")
-            app_result = {
-                "app": app_name,
-                "id": app_id,
-                "version": version,
-                "archive": obj_name,
-                "businessObjects": [],
-            }
-            succeeded.append(app_result)
+            obj_name = f"vbcs-backup/{ts}/{app_id}_{version}_app.zip"
+            upload_to_object_storage(namespace, bucket, obj_name, archive)
+            app_result = {"app": app_id, "version": version, "archive": obj_name}
 
-            # ── Business Object data (CSV) ────────────────────────────────────
+            # ── BO data ZIP (optional) ────────────────────────────────────────
             if backup_data:
-                bos = list_business_objects(config, access_token, app_id, version)
-                for bo in bos:
-                    bo_name = bo.get("name", bo) if isinstance(bo, dict) else str(bo)
-                    csv_data = export_business_object_data(
-                        config, access_token, app_id, version, bo_name
-                    )
-                    if csv_data:
-                        csv_obj = f"vbcs-backup/{ts}/{app_id}/data/{bo_name}.csv"
-                        upload_to_object_storage(namespace, bucket, csv_obj, csv_data, content_type="text/csv")
-                        app_result["businessObjects"].append({"bo": bo_name, "object": csv_obj})
-                    else:
-                        logger.warning(f"Skipping BO data export for {app_id}/{bo_name}")
+                scope   = "deployment" if app_status in ("live", "LIVE", "STAGED") else "design"
+                bo_data = export_vbcs_bo_data(config, access_token, app_id, version, scope)
+                if bo_data:
+                    bo_obj = f"vbcs-backup/{ts}/{app_id}_{version}_bo_data.zip"
+                    upload_to_object_storage(namespace, bucket, bo_obj, bo_data)
+                    app_result["boData"] = bo_obj
+
+            succeeded.append(app_result)
         else:
-            failed.append({"app": app_name, "id": app_id, "version": version})
+            failed.append({"app": app_id, "version": version})
 
     total = len(succeeded) + len(failed)
 
@@ -267,10 +241,10 @@ def run_backup(secret_ocid):
             f"VBCS backup completed with {len(failed)} failure(s) out of {total} application(s).\n"
             f"Failed: {', '.join(f['app'] for f in failed)}"
         )
-        send_failure_notification(config, msg, subject="VBCS Backup - Partial Failure")
+        send_failure_notification(config, msg, subject="VBCS Backup Partial Failure")
         logger.warning(msg)
     else:
-        logger.info(f"VBCS backup completed. {len(succeeded)}/{total} application(s) backed up.")
+        logger.info(f"VBCS backup completed successfully for {len(apps)} application(s).")
 
     return {
         "status": "COMPLETED" if not failed else "PARTIAL",

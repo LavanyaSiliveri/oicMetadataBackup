@@ -36,7 +36,7 @@ import requests
 from shared_utils import (
     get_access_token,
     get_config_from_vault,
-    get_integration_client,
+    get_instance_status,
     send_failure_notification,
 )
 
@@ -46,16 +46,6 @@ logger = logging.getLogger(__name__)
 EXPORT_API_PATH        = "/ic/api/common/v1/exportServiceInstanceArchive"
 POLL_INTERVAL_SECONDS  = 15
 DEFAULT_TIMEOUT_SECONDS = 270  # stays inside the 300s function timeout
-
-
-# ─── OIC Instance Status ──────────────────────────────────────────────────────
-
-
-def get_instance_status(instance_ocid):
-    """Return the OIC instance lifecycle_state (ACTIVE, INACTIVE, …)."""
-    client   = get_integration_client()
-    instance = client.get_integration_instance(instance_ocid)
-    return instance.data.lifecycle_state
 
 
 # ─── Export Service Instance Archive ──────────────────────────────────────────
