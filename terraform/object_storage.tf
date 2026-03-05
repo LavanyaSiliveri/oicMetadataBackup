@@ -5,24 +5,23 @@ data "oci_objectstorage_namespace" "this" {
 }
 
 # ─── Backup Bucket ─────────────────────────────────────────────────────────────
-# Stores all OIC metadata backup runs under:
-#   {backup_prefix}/{YYYY-MM-DD_HH-MM-SS}/integrations/*.iar
-#   {backup_prefix}/{YYYY-MM-DD_HH-MM-SS}/connections/connections.json
-#   {backup_prefix}/{YYYY-MM-DD_HH-MM-SS}/lookups/lookups.json
-#   {backup_prefix}/{YYYY-MM-DD_HH-MM-SS}/packages/packages.json
-#   {backup_prefix}/{YYYY-MM-DD_HH-MM-SS}/summary.json
+# OIC writes the service instance archive directly to this bucket using the
+# Swift-compatible endpoint. The function itself never touches the bucket —
+# it only triggers the OIC export job and polls for completion.
+#
+# After apply, use the outputs below to construct the SWIFT_URL for the
+# Vault secret config:
+#   https://swiftobjectstorage.<region>.oraclecloud.com/v1/<namespace>/<bucket-name>
 
 resource "oci_objectstorage_bucket" "backup" {
   compartment_id = var.compartment_ocid
   namespace      = data.oci_objectstorage_namespace.this.namespace
-  name           = var.bucket_name
-  access_type    = var.bucket_access_type
-
-  # Versioning is disabled by default; enable if you want object-level version history.
-  versioning = "Disabled"
+  name           = "${var.prefix}-oic-metadata-backups"
+  access_type    = "NoPublicAccess"
+  versioning     = "Disabled"
 
   freeform_tags = {
-    "project"   = "oic-metadata-backup"
+    "project"    = "oic-metadata-backup"
     "managed-by" = "terraform"
   }
 }

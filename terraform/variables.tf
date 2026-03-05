@@ -52,93 +52,21 @@ variable "subnet_ids" {
   description = "List of subnet OCIDs for the Functions Application. At least one required."
 }
 
-# ─── OIC Configuration ────────────────────────────────────────────────────────
+# ─── Vault Config Secret ──────────────────────────────────────────────────────
+# The function reads a single JSON secret from OCI Vault that contains all
+# OIC credentials and storage configuration (see README for the secret schema).
 
-variable "oic_base_url" {
+variable "secret_ocid" {
   type        = string
-  description = "Base URL of the OIC instance, e.g. https://myoic.integration.ocp.oraclecloud.com"
-}
-
-variable "oic_service_instance" {
-  type        = string
-  description = "OIC service instance name (visible on the OIC About page under 'Service instance')."
-}
-
-variable "oic_username" {
-  type        = string
-  description = "OIC username for basic authentication. Leave empty if using Vault secrets."
-  default     = ""
-  sensitive   = true
-}
-
-variable "oic_password" {
-  type        = string
-  description = "OIC password for basic authentication. Leave empty if using Vault secrets."
-  default     = ""
-  sensitive   = true
-}
-
-variable "oic_username_secret_ocid" {
-  type        = string
-  description = "OCID of the OCI Vault secret that holds the OIC username. Takes priority over oic_username."
-  default     = ""
-}
-
-variable "oic_password_secret_ocid" {
-  type        = string
-  description = "OCID of the OCI Vault secret that holds the OIC password. Takes priority over oic_password."
-  default     = ""
-}
-
-# ─── Object Storage ───────────────────────────────────────────────────────────
-
-variable "bucket_name" {
-  type        = string
-  description = "Name of the OCI Object Storage bucket for storing backups."
-  default     = "oic-metadata-backups"
-}
-
-variable "bucket_access_type" {
-  type        = string
-  description = "Access type for the backup bucket. Use NoPublicAccess for private backups."
-  default     = "NoPublicAccess"
-}
-
-# ─── Backup Behaviour ─────────────────────────────────────────────────────────
-
-variable "backup_prefix" {
-  type        = string
-  description = "Folder prefix within the bucket for all backup runs (e.g. 'backups')."
-  default     = "backups"
-}
-
-variable "include_inactive" {
-  type        = bool
-  description = "When true, backs up non-ACTIVATED integrations (CONFIGURED, DRAFT) as well."
-  default     = false
-}
-
-variable "backup_connections" {
-  type        = bool
-  description = "When true, exports connection metadata (no credentials) as JSON."
-  default     = true
-}
-
-variable "backup_lookups" {
-  type        = bool
-  description = "When true, exports lookup table definitions as JSON."
-  default     = true
-}
-
-variable "backup_packages" {
-  type        = bool
-  description = "When true, exports package list as JSON."
-  default     = true
+  description = "OCID of the OCI Vault secret holding the OIC backup config JSON."
 }
 
 # ─── Notifications ─────────────────────────────────────────────────────────────
+# The ONS topic OCID is embedded inside the Vault secret (ONS_TOPIC_OCID key).
+# The email variable below is only used by Terraform to provision the topic
+# and its subscription; it must match what is placed in the Vault secret.
 
 variable "notification_email" {
   type        = string
-  description = "Email address for backup success/failure notifications. Must confirm OCI subscription email."
+  description = "Email address for backup success/failure notifications. Must confirm the OCI subscription email."
 }

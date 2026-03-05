@@ -13,34 +13,21 @@ def handler(ctx, data: io.BytesIO = None):
     try:
         logging.getLogger().info("Invoking oicMetadataBackup function")
 
-        # Merge function config with any JSON body overrides
-        # Function config vars are the primary configuration source;
-        # a JSON body (if provided) can override individual keys for ad-hoc runs.
-        cfg = dict(ctx.Config())
+        secret_ocid = ctx.Config().get("SECRET_OCID", "").strip()
+        if not secret_ocid:
+            return response.Response(
+                ctx,
+                response_data=json.dumps({"error": "SECRET_OCID is not configured."}),
+                headers={"Content-Type": "application/json"},
+                status_code=400,
+            )
 
-        if data:
-            try:
-                body = json.loads(data.getvalue())
-                if isinstance(body, dict):
-                    cfg.update(body)
-            except (ValueError, Exception):
-                pass
-
-        summary = oicMetadataBackup.backup_oic_metadata(cfg)
+        result = oicMetadataBackup.run_backup(secret_ocid)
 
         return response.Response(
             ctx,
-            response_data=json.dumps(summary, default=str),
+            response_data=json.dumps(result),
             headers={"Content-Type": "application/json"},
-        )
-
-    except ValueError as ve:
-        logging.getLogger().error(f"Configuration error: {ve}")
-        return response.Response(
-            ctx,
-            response_data=json.dumps({"error": str(ve)}),
-            headers={"Content-Type": "application/json"},
-            status_code=400,
         )
 
     except Exception as ex:

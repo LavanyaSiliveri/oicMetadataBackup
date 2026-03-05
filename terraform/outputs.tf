@@ -13,19 +13,24 @@ output "functions_application_name" {
 # ─── Object Storage ───────────────────────────────────────────────────────────
 
 output "backup_bucket_name" {
-  description = "Name of the OCI Object Storage bucket where backups are stored."
+  description = "Name of the OCI Object Storage bucket where OIC will write archives."
   value       = oci_objectstorage_bucket.backup.name
 }
 
 output "object_storage_namespace" {
-  description = "OCI Object Storage namespace for this tenancy."
+  description = "OCI Object Storage namespace — use this in the SWIFT_URL inside your Vault secret."
   value       = data.oci_objectstorage_namespace.this.namespace
+}
+
+output "swift_url" {
+  description = "Swift-compatible URL for the backup bucket. Use this as SWIFT_URL in the Vault secret config."
+  value       = "https://swiftobjectstorage.${var.region}.oraclecloud.com/v1/${data.oci_objectstorage_namespace.this.namespace}/${oci_objectstorage_bucket.backup.name}"
 }
 
 # ─── Notifications ────────────────────────────────────────────────────────────
 
 output "notification_topic_ocid" {
-  description = "OCID of the ONS notification topic. Also set as NOTIFICATION_TOPIC_OCID in the function app config."
+  description = "OCID of the ONS notification topic — use this as ONS_TOPIC_OCID in the Vault secret config."
   value       = oci_ons_notification_topic.this.id
 }
 
@@ -36,7 +41,7 @@ output "dynamic_group_name" {
   value       = oci_identity_dynamic_group.fn_dg.name
 }
 
-# ─── Ready-to-use Invocation Commands ────────────────────────────────────────
+# ─── Invocation ───────────────────────────────────────────────────────────────
 
 output "fn_deploy_command" {
   description = "Command to deploy the function after terraform apply."
@@ -44,15 +49,8 @@ output "fn_deploy_command" {
 }
 
 output "fn_invoke_command" {
-  description = "Command to manually invoke the backup function."
+  description = "Command to manually trigger a backup."
   value       = "echo '{}' | fn invoke ${oci_functions_application.this.display_name} oicmetadatabackup"
-}
-
-output "fn_invoke_command_with_override" {
-  description = "Example invocation overriding a single config value (e.g. run a one-off backup to a different prefix)."
-  value = jsonencode({
-    BACKUP_PREFIX = "manual-backup"
-  })
 }
 
 # ─── Post-apply Reminder ──────────────────────────────────────────────────────
@@ -61,12 +59,16 @@ output "next_steps" {
   description = "Actions required after terraform apply."
   value       = <<-EOT
     1. Confirm the subscription email sent to ${var.notification_email}.
-    2. Deploy the function:
+    2. Create the Vault secret JSON (see README) using these values:
+         SWIFT_URL        = https://swiftobjectstorage.${var.region}.oraclecloud.com/v1/${data.oci_objectstorage_namespace.this.namespace}/${oci_objectstorage_bucket.backup.name}
+         ONS_TOPIC_OCID   = ${oci_ons_notification_topic.this.id}
+    3. Store the secret OCID in terraform.tfvars as secret_ocid.
+    4. Deploy the function:
          cd /path/to/oicMetadataBackup
          fn use context <your-fn-context>
          fn deploy --app ${oci_functions_application.this.display_name}
-    3. Test the function:
+    5. Test:
          echo '{}' | fn invoke ${oci_functions_application.this.display_name} oicmetadatabackup
-    4. Schedule the function (see README — Scheduling section).
+    6. Schedule: OCI Console -> Functions -> Application -> oicmetadatabackup -> Triggers -> Add Scheduled Trigger
   EOT
 }
