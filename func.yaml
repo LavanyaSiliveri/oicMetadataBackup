@@ -1,0 +1,24 @@
+schema_version: 20180708
+name: oicmetadatabackup
+version: 0.0.1
+runtime: python
+build_image: fnproject/python:3.11-dev
+run_image: fnproject/python:3.11
+entrypoint: /python/bin/fdk /function/func.py handler
+memory: 512
+timeout: 300
+config:
+  OIC_BASE_URL: ""
+  OIC_SERVICE_INSTANCE: ""
+  OIC_USERNAME: ""
+  OIC_PASSWORD: ""
+  OIC_USERNAME_SECRET_OCID: ""
+  OIC_PASSWORD_SECRET_OCID: ""
+  OBJECT_STORAGE_BUCKET_NAME: ""
+  OBJECT_STORAGE_NAMESPACE: ""
+  BACKUP_PREFIX: "backups"
+  INCLUDE_INACTIVE: "false"
+  BACKUP_CONNECTIONS: "true"
+  BACKUP_LOOKUPS: "true"
+  BACKUP_PACKAGES: "true"
+  NOTIFICATION_TOPIC_OCID: ""
