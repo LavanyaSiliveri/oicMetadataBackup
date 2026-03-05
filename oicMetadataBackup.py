@@ -1,112 +1,61 @@
-import base64
-import json
+"""
+oicMetadataBackup.py — Oracle Integration Cloud (OIC) Metadata Backup.
+
+Uses the OIC exportServiceInstanceArchive API to trigger a full design-time
+metadata export. OIC writes the archive directly to OCI Object Storage via
+the Swift endpoint — no data flows through this function.
+
+APIs used
+---------
+Trigger export : POST /ic/api/common/v1/exportServiceInstanceArchive
+Poll status    : GET  /ic/api/common/v1/exportServiceInstanceArchive/{jobId}
+
+Required Vault secret keys
+--------------------------
+OIC_CLIENT_ID        : OAuth2 client ID
+OIC_CLIENT_SECRET    : OAuth2 client secret
+OIC_IDCS_TOKEN_URL   : IDCS token endpoint
+OIC_SCOPE            : OAuth2 scope for OIC
+OIC_INSTANCE_NAME    : OIC service instance name (shown on About page)
+OIC_INSTANCE_OCID    : OCID of the OIC integration instance resource
+OIC_API_HOST         : OIC design-time hostname
+                       e.g. design.integration.<region>.ocp.oraclecloud.com
+SWIFT_URL            : Swift-compatible Object Storage URL for the archive
+                       e.g. https://swiftobjectstorage.<region>.oraclecloud.com/v1/<ns>/<bucket>
+SWIFT_USER           : Swift auth user  (<tenancy>/<username>)
+SWIFT_PASSWORD       : Swift auth token (OCI user Auth Token)
+ONS_TOPIC_OCID       : ONS topic OCID for success/failure notifications
+"""
+
 import logging
 import time
-from base64 import b64encode
 from datetime import datetime
 
-import oci
 import requests
 
-# Setup logging
+from shared_utils import (
+    get_access_token,
+    get_config_from_vault,
+    get_integration_client,
+    send_failure_notification,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-EXPORT_API_PATH = "/ic/api/common/v1/exportServiceInstanceArchive"
-POLL_INTERVAL_SECONDS = 15
-DEFAULT_TIMEOUT_SECONDS = 270  # stay inside the 300s function timeout
-
-
-# ─── OCI Client Helpers ────────────────────────────────────────────────────────
-
-
-def _get_secrets_client():
-    try:
-        signer = oci.auth.signers.get_resource_principals_signer()
-        return oci.secrets.SecretsClient(config={}, signer=signer)
-    except Exception:
-        config = oci.config.from_file("~/.oci/config")
-        return oci.secrets.SecretsClient(config)
-
-
-def _get_integration_client():
-    try:
-        signer = oci.auth.signers.get_resource_principals_signer()
-        return oci.integration.IntegrationInstanceClient(config={}, signer=signer)
-    except Exception:
-        config = oci.config.from_file("~/.oci/config")
-        return oci.integration.IntegrationInstanceClient(config)
-
-
-def _get_ons_client():
-    try:
-        signer = oci.auth.signers.get_resource_principals_signer()
-        return oci.ons.NotificationDataPlaneClient(config={}, signer=signer)
-    except Exception:
-        config = oci.config.from_file("~/.oci/config")
-        return oci.ons.NotificationDataPlaneClient(config)
-
-
-# ─── Vault Config Loader ──────────────────────────────────────────────────────
-
-
-def get_config_from_vault(secret_ocid):
-    """
-    Load and parse the JSON config stored as an OCI Vault secret.
-
-    Expected secret JSON structure:
-    {
-      "OIC_CLIENT_ID":       "<OAUTH_APP_CLIENT_ID>",
-      "OIC_CLIENT_SECRET":   "<OAUTH_APP_CLIENT_SECRET>",
-      "OIC_IDCS_TOKEN_URL":  "https://idcs-xxx.identity.oraclecloud.com/oauth2/v1/token",
-      "OIC_SCOPE":           "https://<OIC_ID>.integration.<REGION>.ocp.oraclecloud.com:443urn:opc:resource:consumer::all",
-      "OIC_INSTANCE_NAME":   "<OIC_INSTANCE_NAME>",
-      "OIC_INSTANCE_OCID":   "<OIC_INSTANCE_OCID>",
-      "OIC_API_HOST":        "design.integration.<REGION>.ocp.oraclecloud.com",
-      "SWIFT_URL":           "https://swiftobjectstorage.<REGION>.oraclecloud.com/v1/<NAMESPACE>/<BUCKET>",
-      "SWIFT_USER":          "<TENANCY>/<USERNAME>",
-      "SWIFT_PASSWORD":      "<AUTH_TOKEN>",
-      "ONS_TOPIC_OCID":      "<ONS_TOPIC_OCID>"
-    }
-    """
-    client = _get_secrets_client()
-    bundle = client.get_secret_bundle(secret_ocid)
-    encoded = bundle.data.secret_bundle_content.content
-    decoded = base64.b64decode(encoded).decode("utf-8")
-    return json.loads(decoded)
+EXPORT_API_PATH        = "/ic/api/common/v1/exportServiceInstanceArchive"
+POLL_INTERVAL_SECONDS  = 15
+DEFAULT_TIMEOUT_SECONDS = 270  # stays inside the 300s function timeout
 
 
 # ─── OIC Instance Status ──────────────────────────────────────────────────────
 
 
 def get_instance_status(instance_ocid):
-    """Return the OIC instance lifecycle_state (e.g. ACTIVE, INACTIVE)."""
-    client = _get_integration_client()
+    """Return the OIC instance lifecycle_state (ACTIVE, INACTIVE, …)."""
+    client   = get_integration_client()
     instance = client.get_integration_instance(instance_ocid)
     return instance.data.lifecycle_state
-
-
-# ─── OAuth2 Token ─────────────────────────────────────────────────────────────
-
-
-def get_access_token(config):
-    """Obtain an OAuth2 access token from IDCS using the client credentials grant."""
-    basic_auth = b64encode(
-        f"{config['OIC_CLIENT_ID']}:{config['OIC_CLIENT_SECRET']}".encode()
-    ).decode()
-
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": f"Basic {basic_auth}",
-    }
-    data = {
-        "grant_type": "client_credentials",
-        "scope": config["OIC_SCOPE"],
-    }
-
-    resp = requests.post(config["OIC_IDCS_TOKEN_URL"], headers=headers, data=data, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
 
 
 # ─── Export Service Instance Archive ──────────────────────────────────────────
@@ -116,10 +65,8 @@ def trigger_export(config, access_token):
     """
     POST to exportServiceInstanceArchive.
 
-    OIC writes the archive directly to the Swift/Object Storage URL —
-    no data flows through this function.
-
-    Returns the job_id string on success, raises on failure.
+    OIC writes the full design-time archive directly to Object Storage via
+    the Swift credentials in storageInfo.  Returns the job_id string.
     """
     job_name = (
         f"{config['OIC_INSTANCE_NAME']}_Backup_"
@@ -131,37 +78,36 @@ def trigger_export(config, access_token):
         "exportSecurityArtifacts": False,
         "description": f"Scheduled metadata backup of OIC instance {config['OIC_INSTANCE_NAME']}",
         "storageInfo": {
-            "storageUrl": config["SWIFT_URL"],
-            "storageUser": config["SWIFT_USER"],
+            "storageUrl":      config["SWIFT_URL"],
+            "storageUser":     config["SWIFT_USER"],
             "storagePassword": config["SWIFT_PASSWORD"],
         },
     }
 
-    export_url = (
+    url = (
         f"https://{config['OIC_API_HOST']}{EXPORT_API_PATH}"
         f"?integrationInstance={config['OIC_INSTANCE_NAME']}"
     )
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.post(export_url, headers=headers, json=payload, timeout=30)
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
     resp.raise_for_status()
 
     job_id = resp.json()["jobId"]
-    logger.info(f"Export job started: jobId={job_id}, jobName={job_name}")
+    logger.info(f"OIC export job started: jobId={job_id}, jobName={job_name}")
     return job_id
-
-
-# ─── Poll Export Job Status ───────────────────────────────────────────────────
 
 
 def poll_export_status(config, access_token, job_id, timeout_seconds=DEFAULT_TIMEOUT_SECONDS):
     """
     Poll the export job until it reaches COMPLETED or FAILED, or until timeout.
-
     Returns the final overallStatus string.
     """
     status_url = (
@@ -173,7 +119,7 @@ def poll_export_status(config, access_token, job_id, timeout_seconds=DEFAULT_TIM
         "Content-Type": "application/json",
     }
 
-    # Brief initial pause to let OIC register the job
+    # Brief pause to let OIC register the job
     time.sleep(10)
     start_time = time.time()
 
@@ -181,13 +127,13 @@ def poll_export_status(config, access_token, job_id, timeout_seconds=DEFAULT_TIM
         elapsed = time.time() - start_time
         if elapsed > timeout_seconds:
             raise TimeoutError(
-                f"Export job {job_id} did not complete within {timeout_seconds}s."
+                f"OIC export job {job_id} did not complete within {timeout_seconds}s."
             )
 
         resp = requests.get(status_url, headers=headers, timeout=30)
         resp.raise_for_status()
         status = resp.json().get("overallStatus", "UNKNOWN")
-        logger.info(f"Job {job_id} — status: {status} (elapsed: {elapsed:.0f}s)")
+        logger.info(f"OIC job {job_id} — status: {status} (elapsed: {elapsed:.0f}s)")
 
         if status in ("COMPLETED", "FAILED"):
             return status
@@ -195,48 +141,24 @@ def poll_export_status(config, access_token, job_id, timeout_seconds=DEFAULT_TIM
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
-# ─── Notifications ────────────────────────────────────────────────────────────
-
-
-def send_notification(config, message, subject="OIC Backup Notification"):
-    """Publish a message to the ONS topic from config. Logs but does not raise."""
-    topic_ocid = config.get("ONS_TOPIC_OCID", "").strip()
-    if not topic_ocid:
-        return
-    try:
-        client = _get_ons_client()
-        client.publish_message(
-            topic_id=topic_ocid,
-            message_details=oci.ons.models.MessageDetails(
-                title=subject,
-                body=message,
-            ),
-        )
-        logger.info(f"Notification sent: {subject}")
-    except Exception as e:
-        logger.error(f"Failed to send notification: {e}")
-
-
-# ─── Main Orchestration ───────────────────────────────────────────────────────
+# ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 
 def run_backup(secret_ocid):
     """
-    Full backup flow:
-      1. Load config JSON from OCI Vault secret
+    End-to-end OIC metadata backup:
+      1. Load config from OCI Vault
       2. Check OIC instance is ACTIVE — skip and notify if not
-      3. Obtain OAuth2 access token from IDCS
+      3. Obtain OAuth2 access token
       4. POST exportServiceInstanceArchive (OIC writes directly to Object Storage)
       5. Poll until COMPLETED / FAILED / timeout
       6. Send success or failure notification via ONS
 
     Returns a result dict.
     """
-    # 1. Config from Vault
-    logger.info(f"Loading config from Vault secret: {secret_ocid}")
     config = get_config_from_vault(secret_ocid)
 
-    # 2. OIC instance status check
+    # Instance status check
     logger.info(f"Checking OIC instance status: {config['OIC_INSTANCE_OCID']}")
     instance_status = get_instance_status(config["OIC_INSTANCE_OCID"])
     logger.info(f"OIC instance lifecycle state: {instance_status}")
@@ -247,43 +169,43 @@ def run_backup(secret_ocid):
             "Backup will not be initiated."
         )
         logger.warning(msg)
-        send_notification(config, msg, subject="OIC Backup Skipped - Instance Not Active")
+        send_failure_notification(config, msg, subject="OIC Backup Skipped - Instance Not Active")
         return {"status": "SKIPPED", "reason": msg}
 
-    # 3. OAuth2 token
-    logger.info("Obtaining OAuth2 access token from IDCS...")
-    access_token = get_access_token(config)
+    # OAuth2 token
+    logger.info("Obtaining OAuth2 access token for OIC...")
+    access_token = get_access_token(config, prefix="OIC")
 
-    # 4. Trigger export
+    # Trigger export
     logger.info("Triggering exportServiceInstanceArchive...")
     job_id = trigger_export(config, access_token)
 
-    # 5. Poll for completion
+    # Poll
     try:
         final_status = poll_export_status(config, access_token, job_id)
     except TimeoutError as e:
         msg = str(e)
         logger.error(msg)
-        send_notification(config, msg, subject="OIC Backup Failed - Timeout")
+        send_failure_notification(config, msg, subject="OIC Backup Failed - Timeout")
         return {"status": "TIMEOUT", "jobId": job_id, "error": msg}
 
-    # 6. Notify
+    # Notify
     if final_status == "COMPLETED":
-        msg = (
+        send_failure_notification(
+            config,
             f"OIC metadata backup completed successfully.\n"
             f"Instance: {config['OIC_INSTANCE_NAME']}\n"
             f"Job ID: {job_id}\n"
-            f"Storage: {config['SWIFT_URL']}"
+            f"Storage: {config['SWIFT_URL']}",
+            subject="OIC Backup Completed Successfully",
         )
-        logger.info(f"Backup COMPLETED: jobId={job_id}")
-        send_notification(config, msg, subject="OIC Backup Completed Successfully")
     else:
-        msg = (
-            f"OIC metadata backup job ended with status: {final_status}\n"
-            f"Instance: {config['OIC_INSTANCE_NAME']}\n"
-            f"Job ID: {job_id}"
+        send_failure_notification(
+            config,
+            f"OIC export job ended with status: {final_status}\n"
+            f"Instance: {config['OIC_INSTANCE_NAME']}\nJob ID: {job_id}",
+            subject="OIC Backup Failed",
         )
-        logger.error(msg)
-        send_notification(config, msg, subject="OIC Backup Failed")
 
+    logger.info(f"OIC backup finished: status={final_status}, jobId={job_id}")
     return {"status": final_status, "jobId": job_id}

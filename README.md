@@ -1,16 +1,12 @@
 # oicMetadataBackup — OCI Function
 
-An OCI Scheduled Function that takes periodic metadata backups of an **Oracle Integration Cloud (OIC)** instance. It uses the OIC `exportServiceInstanceArchive` API to export the complete OIC design-time metadata in a single job — OIC writes the archive directly to OCI Object Storage via the Swift endpoint. The function triggers the export, polls for completion, and sends success or failure alerts via OCI Notification Service (ONS).
+An OCI Scheduled Function that takes periodic metadata backups of an Oracle Integration Cloud (OIC) instance and its associated services. A single function handles three backup modules, all controlled by flags in one OCI Vault secret:
 
----
-
-## Advantages
-
-- Keep track of changes made to integrations and connections over time
-- Metadata is readily available to clone the existing instance for quick testing without changing the production environment
-- Flexibility to access a particular date/time snapshot of integration configuration
-- Checks OIC instance status before initiating the backup and notifies admin if the instance is INACTIVE
-- Notified on any failure so no backup is silently missed
+| Module | What it backs up | API |
+|---|---|---|
+| **OIC** | Full design-time archive written directly to Object Storage via Swift | `exportServiceInstanceArchive` |
+| **VBCS** | Every Visual Builder application as a zip, plus optional Business Object data as CSV | VBCS Builder Resources API |
+| **OPA** | Every Process Automation application and Decision Model as `.expx` | OPA Design REST API |
 
 ---
 
@@ -22,35 +18,45 @@ OCI Scheduled Functions (cron)
           ▼
    OCI Function (oicmetadatabackup)
           │
-          ├── Reads config JSON from OCI Vault secret
-          │     (OIC credentials, storage info, ONS topic)
+          ├── shared_utils.py — Vault, OAuth2, Object Storage, ONS helpers
           │
-          ├── Checks OIC instance lifecycle state via OCI SDK
-          │     → Skips and notifies if INACTIVE
+          ├── oicMetadataBackup.py  (BACKUP_OIC=true)
+          │     Check OIC instance ACTIVE → OAuth2 token → POST exportServiceInstanceArchive
+          │     OIC writes archive directly to Object Storage via Swift
+          │     Poll job until COMPLETED/FAILED → notify
           │
-          ├── Obtains OAuth2 token from IDCS (client credentials)
+          ├── vbcsBackup.py  (BACKUP_VBCS=true)
+          │     OAuth2 token → list apps → export each app as .zip
+          │     Optionally list + export Business Object data as CSV
+          │     Upload to Object Storage via OCI SDK → notify on failure
           │
-          ├── POST /ic/api/common/v1/exportServiceInstanceArchive
-          │     → OIC writes archive DIRECTLY to Object Storage (Swift)
-          │     → Function only triggers and polls — no data flows through it
-          │
-          ├── Polls GET /ic/api/common/v1/exportServiceInstanceArchive/{jobId}
-          │     until COMPLETED / FAILED / timeout
-          │
-          └── Publishes result to ONS → Email notification
+          └── opaBackup.py  (BACKUP_OPA=true)
+                OAuth2 token → list process apps → export each as .expx
+                List decision (DMN) apps → export each as .expx
+                Upload to Object Storage via OCI SDK → notify on failure
 ```
 
 ---
 
-## OCI Services used
+## Object Storage layout
 
-| Service | Purpose |
-|---|---|
-| OCI Functions | Hosts and runs the backup function |
-| OCI Vault | Stores all config (OIC credentials, Swift URL, ONS topic OCID) as a single JSON secret |
-| OCI Object Storage | Receives the archive written directly by OIC via Swift |
-| OCI Notification Service (ONS) | Sends success/failure email alerts |
-| OCI Identity (IAM) | Dynamic Group + policies for Resource Principal auth |
+```
+{bucket}/
+├── (OIC writes its archive here directly — filename set by OIC job)
+├── vbcs-backup/
+│   └── {YYYY-MM-DD_HH-MM-SS}/
+│       ├── MyApp_1_0.zip
+│       └── MyApp/
+│           └── data/
+│               ├── Employee.csv
+│               └── Department.csv
+└── opa-backup/
+    └── {YYYY-MM-DD_HH-MM-SS}/
+        ├── process/
+        │   └── OnboardingProcess_1.0.expx
+        └── decisions/
+            └── CreditDecision_1.0.expx
+```
 
 ---
 
@@ -58,84 +64,74 @@ OCI Scheduled Functions (cron)
 
 ```
 oicMetadataBackup/
-├── func.py                  # FDK handler — reads SECRET_OCID, calls run_backup()
-├── oicMetadataBackup.py     # Core logic: Vault, OAuth2, export, poll, notify
-├── func.yaml                # Python 3.11, 512 MB, 300s timeout
-├── requirements.txt         # fdk, oci, requests
-└── terraform/               # Infrastructure-as-Code
+├── func.py                # FDK handler — reads SECRET_OCID, runs enabled modules
+├── shared_utils.py        # Common: Vault loader, OAuth2, Object Storage, ONS
+├── oicMetadataBackup.py   # OIC exportServiceInstanceArchive + poll
+├── vbcsBackup.py          # VBCS app archive + Business Object CSV export
+├── opaBackup.py           # OPA process + DMN application .expx export
+├── func.yaml              # Python 3.11, 512 MB, 300s timeout
+├── requirements.txt       # fdk, oci, requests
+└── terraform/
     ├── provider.tf
     ├── variables.tf
-    ├── iam.tf               # Dynamic Group + IAM policy
-    ├── object_storage.tf    # Backup bucket (OIC writes here via Swift)
-    ├── notifications.tf     # ONS topic + email subscription
-    ├── functions.tf         # Functions Application (SECRET_OCID config only)
-    └── outputs.tf           # swift_url, topic OCID, deploy/invoke commands
+    ├── iam.tf             # Dynamic Group + policy (Vault, OIC, Object Storage, ONS)
+    ├── object_storage.tf  # Backup bucket
+    ├── notifications.tf   # ONS topic + email subscription
+    ├── functions.tf       # Functions Application
+    └── outputs.tf
 ```
 
 ---
 
 ## Prerequisites
 
-- An OIC instance with a **Confidential Application** (OAuth client) registered in IDCS/IAM with the `ServiceAdministrator` or `ServiceDeveloper` role
-- An OCI IAM user (service account) with an **Auth Token** — used as `SWIFT_PASSWORD` in the Vault secret
+- OIC instance with a **Confidential Application** registered in IDCS/IAM
+- OCI IAM user with an **Auth Token** (for OIC Swift storage — OIC module only)
 - OCI Vault already created
-- `fn` CLI installed and configured (`fn use context <your-context>`)
+- `fn` CLI installed and configured
 - Docker installed and running
 
 ---
 
-## Setup
+## Vault Secret JSON Schema
 
-### Step 1 — Create an IAM Service Account and Auth Token
-
-1. In **Identity → Users**, create or select a service account user
-2. Go to that user → **Auth Tokens → Generate Token**
-3. Note the token value — this is your `SWIFT_PASSWORD`
-4. The `SWIFT_USER` format is `<tenancy_name>/<username>`
-
-### Step 2 — Register a Confidential Application in IDCS
-
-1. In the OIC Console → **Settings → OAuth** (or via IDCS/IAM), create a Confidential Application
-2. Grant it the OIC scope:
-   ```
-   https://<OIC_INSTANCE_ID>.integration.<REGION>.ocp.oraclecloud.com:443urn:opc:resource:consumer::all
-   ```
-3. Note the `Client ID` and `Client Secret`
-4. Note the IDCS token URL: `https://idcs-<id>.identity.oraclecloud.com/oauth2/v1/token`
-
-### Step 3 — Create an ONS Topic and Email Subscription
-
-1. Go to **Notifications → Create Topic**
-2. Add an **Email subscription** and confirm the subscription email
-3. Note the **Topic OCID**
-
-### Step 4 — Store config in OCI Vault as a secret
-
-Create a Vault secret with the following JSON value:
+All configuration lives in a single JSON secret stored in OCI Vault. The `SECRET_OCID` of this secret is the only value the function needs at runtime.
 
 ```json
 {
   "OIC_CLIENT_ID":       "<OAUTH_APP_CLIENT_ID>",
   "OIC_CLIENT_SECRET":   "<OAUTH_APP_CLIENT_SECRET>",
   "OIC_IDCS_TOKEN_URL":  "https://idcs-xxxxxxxx.identity.oraclecloud.com/oauth2/v1/token",
-  "OIC_SCOPE":           "https://<OIC_INSTANCE_ID>.integration.<REGION>.ocp.oraclecloud.com:443urn:opc:resource:consumer::all",
+  "OIC_SCOPE":           "https://<OIC_ID>.integration.<REGION>.ocp.oraclecloud.com:443urn:opc:resource:consumer::all",
   "OIC_INSTANCE_NAME":   "<OIC_INSTANCE_NAME>",
-  "OIC_INSTANCE_OCID":   "<OIC_INSTANCE_OCID>",
+  "OIC_INSTANCE_OCID":   "ocid1.integrationinstance.oc1...",
   "OIC_API_HOST":        "design.integration.<REGION>.ocp.oraclecloud.com",
-  "SWIFT_URL":           "https://swiftobjectstorage.<REGION>.oraclecloud.com/v1/<NAMESPACE>/<BUCKET_NAME>",
-  "SWIFT_USER":          "<TENANCY_NAME>/<USERNAME>",
+  "SWIFT_URL":           "https://swiftobjectstorage.<REGION>.oraclecloud.com/v1/<NAMESPACE>/<BUCKET>",
+  "SWIFT_USER":          "<TENANCY>/<USERNAME>",
   "SWIFT_PASSWORD":      "<AUTH_TOKEN>",
-  "ONS_TOPIC_OCID":      "<ONS_TOPIC_OCID>"
+
+  "OBJ_STORAGE_NAMESPACE": "<TENANCY_NAMESPACE>",
+  "OBJ_STORAGE_BUCKET":    "<BUCKET_NAME>",
+
+  "VBCS_HOST":  "design.integration.<REGION>.ocp.oraclecloud.com",
+  "VBCS_SCOPE": "https://<OIC_ID>.integration.<REGION>.ocp.oraclecloud.com:443urn:opc:resource:consumer::all",
+
+  "OPA_HOST":  "<OPA_INSTANCE_HOST>",
+  "OPA_SCOPE": "<OPA_OAUTH_SCOPE>",
+
+  "ONS_TOPIC_OCID": "ocid1.onstopic.oc1...",
+
+  "BACKUP_OIC":           "true",
+  "BACKUP_VBCS":          "true",
+  "BACKUP_OPA":           "true",
+  "BACKUP_VBCS_DATA":     "false",
+  "EXPORT_DECISION_APPS": "true"
 }
 ```
 
-> The `SWIFT_URL`, `NAMESPACE`, and `ONS_TOPIC_OCID` values are output by `terraform apply` — you can run Terraform first, then create the secret.
+### Credential fallback
 
-Note the **Secret OCID** — this is the only value the function needs at runtime.
-
-### Step 5 — Configure the OIC Instance Storage
-
-In the OIC Console → **Settings → Storage**, configure the storage URL using the same Swift URL. This is required for `exportServiceInstanceArchive` to know where to write.
+`VBCS_CLIENT_ID`, `VBCS_CLIENT_SECRET`, `VBCS_IDCS_TOKEN_URL`, `OPA_CLIENT_ID`, `OPA_CLIENT_SECRET`, and `OPA_IDCS_TOKEN_URL` all fall back to the `OIC_*` equivalents when absent. If all three services share one IDCS confidential app, you only need the `OIC_*` credential keys plus service-specific `SCOPE` and `HOST` values.
 
 ---
 
@@ -145,8 +141,8 @@ In the OIC Console → **Settings → Storage**, configure the storage URL using
 
 | File | Resources |
 |---|---|
-| `iam.tf` | Dynamic Group + IAM policy (read Vault secrets, read integration-instances, use ONS topics) |
-| `object_storage.tf` | Private OCI Object Storage bucket for archives |
+| `iam.tf` | Dynamic Group + IAM policy (Vault, OIC instance check, Object Storage write, ONS) |
+| `object_storage.tf` | Private OCI Object Storage bucket |
 | `notifications.tf` | ONS Notification Topic + Email subscription |
 | `functions.tf` | Functions Application with `SECRET_OCID` config |
 
@@ -164,31 +160,16 @@ compartment_ocid   = "ocid1.compartment.oc1..."
 subnet_ids         = ["ocid1.subnet.oc1..."]
 secret_ocid        = "ocid1.vaultsecret.oc1..."
 notification_email = "you@example.com"
-
-# Optional overrides
-# prefix            = "oicbackup"
-# function_app_name = "OICBackupFuncApp"
 ```
 
-**2. Apply:**
+**2. Apply and deploy:**
 
 ```bash
-cd terraform
-terraform init
-terraform plan
-terraform apply
+cd terraform && terraform init && terraform apply
+cd .. && fn deploy --app OICBackupFuncApp
 ```
 
-**3. Note the outputs** — use `swift_url` and `notification_topic_ocid` when creating the Vault secret (Step 4 above).
-
-**4. Deploy the function:**
-
-```bash
-cd ..
-fn deploy --app OICBackupFuncApp
-```
-
-**5. Test:**
+**3. Test:**
 
 ```bash
 echo '{}' | fn invoke OICBackupFuncApp oicmetadatabackup
@@ -196,7 +177,7 @@ echo '{}' | fn invoke OICBackupFuncApp oicmetadatabackup
 
 ---
 
-## Manual Setup (without Terraform)
+## Manual IAM Setup (without Terraform)
 
 ### Dynamic Group
 
@@ -204,83 +185,74 @@ echo '{}' | fn invoke OICBackupFuncApp oicmetadatabackup
 resource.type = 'fnfunc' AND resource.compartment.id = '<compartment-ocid>'
 ```
 
-### IAM Policy
+### IAM Policies
 
 ```
-Allow dynamic-group <dg-name> to read secret-bundles in compartment <compartment-name>
-Allow dynamic-group <dg-name> to read integration-instances in compartment <compartment-name>
-Allow dynamic-group <dg-name> to use ons-topics in compartment <compartment-name>
-```
-
----
-
-## Deploy
-
-```bash
-cd oicMetadataBackup
-fn deploy --app OICBackupFuncApp
-```
-
----
-
-## Invoke
-
-The function takes no input parameters — everything is read from the Vault secret.
-
-```bash
-echo '{}' | fn invoke OICBackupFuncApp oicmetadatabackup
+Allow dynamic-group <dg-name> to read secret-bundles in compartment <compartment>
+Allow dynamic-group <dg-name> to read integration-instances in compartment <compartment>
+Allow dynamic-group <dg-name> to manage objects in compartment <compartment> where target.bucket.name = '<bucket>'
+Allow dynamic-group <dg-name> to use ons-topics in compartment <compartment>
 ```
 
 ---
 
 ## Scheduling
 
-Use **OCI Scheduled Functions** to run the backup on a cron schedule:
-
-1. OCI Console → **Developer Services → Functions → Applications → OICBackupFuncApp**
-2. Click the `oicmetadatabackup` function → **Triggers → Add Trigger**
-3. Select **Scheduled** trigger type
-4. Set the cron expression, e.g. `0 21 * * *` to run daily at 9 PM UTC
+1. OCI Console → **Functions → Applications → OICBackupFuncApp**
+2. Click `oicmetadatabackup` → **Triggers → Add Trigger**
+3. Select **Scheduled** → set cron expression (e.g. `0 21 * * *` for 9 PM UTC daily)
 
 ---
 
 ## Response
 
 ```json
-{ "status": "COMPLETED", "jobId": "6d3446ed-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }
+{
+  "oic":  { "status": "COMPLETED", "jobId": "6d3446ed-xxxx" },
+  "vbcs": { "status": "COMPLETED", "succeeded": 4, "failed": 0, "details": [...] },
+  "opa":  { "status": "COMPLETED", "succeeded": 6, "failed": 0, "details": [...] }
+}
 ```
+
+### Status values
 
 | Status | Meaning |
 |---|---|
-| `COMPLETED` | Archive written successfully to Object Storage |
-| `FAILED` | OIC reported the export job failed |
-| `TIMEOUT` | Job did not complete within 270 seconds |
-| `SKIPPED` | OIC instance was INACTIVE — backup not initiated |
+| `COMPLETED` | All artifacts backed up successfully |
+| `PARTIAL` | Some artifacts failed — see `details` and check ONS notification |
+| `FAILED` | Auth or list call failed before any export ran |
+| `SKIPPED` | OIC instance was INACTIVE (OIC module only) |
+| `TIMEOUT` | OIC export job did not complete within 270s (OIC module only) |
 
 ---
 
 ## Notification triggers
 
-| Scenario | Subject |
+| Module | Subject |
 |---|---|
-| Export completed successfully | `OIC Backup Completed Successfully` |
-| Export job failed | `OIC Backup Failed` |
-| Job timed out | `OIC Backup Failed - Timeout` |
-| OIC instance not ACTIVE | `OIC Backup Skipped - Instance Not Active` |
+| OIC — success | `OIC Backup Completed Successfully` |
+| OIC — job failed | `OIC Backup Failed` |
+| OIC — timeout | `OIC Backup Failed - Timeout` |
+| OIC — instance inactive | `OIC Backup Skipped - Instance Not Active` |
+| VBCS — auth error | `VBCS Backup Failed - Auth Error` |
+| VBCS — partial | `VBCS Backup - Partial Failure` |
+| OPA — auth error | `OPA Backup Failed - Auth Error` |
+| OPA — partial | `OPA Backup - Partial Failure` |
 
 ---
 
 ## Authentication
 
-The function uses **Resource Principal** for all OCI SDK calls (Vault, OCI Integration client, ONS). OIC itself is authenticated via **OAuth2 client credentials** — the IDCS token is obtained at runtime using credentials stored in the Vault secret.
+All OCI SDK calls (Vault, Integration Instance, Object Storage, ONS) use **Resource Principal** — no credentials embedded in the function. OIC, VBCS, and OPA authenticate via **OAuth2 client credentials** obtained at runtime from IDCS using values stored in the Vault secret.
 
 ---
 
-## Configuration
+## Tuning
 
-Key parameters in [oicMetadataBackup.py](oicMetadataBackup.py):
-
-| Parameter | Default | Description |
-|---|---|---|
-| `POLL_INTERVAL_SECONDS` | `15` | How often to poll the export job status |
-| `DEFAULT_TIMEOUT_SECONDS` | `270` | Max polling time (fits inside the 300s function timeout) |
+| Parameter | File | Default | Notes |
+|---|---|---|---|
+| `POLL_INTERVAL_SECONDS` | `oicMetadataBackup.py` | 15s | OIC job poll frequency |
+| `DEFAULT_TIMEOUT_SECONDS` | `oicMetadataBackup.py` | 270s | Must be < function timeout (300s) |
+| `memory` | `func.yaml` | 512 MB | Increase if handling very large VBCS/OPA apps |
+| `timeout` | `func.yaml` | 300s | Increase if all three modules run on a large instance |
+| `BACKUP_VBCS_DATA` | Vault secret | `false` | Enable with caution — large BOs extend runtime significantly |
